@@ -4,6 +4,7 @@ mod user_handler;
 mod seat_handler;
 mod reservation_handler;
 mod attendance_handler;
+use actix_cors::Cors;
 
 use actix_web::{web, App, HttpServer, HttpResponse, Responder};
 use std::sync::Mutex;
@@ -65,6 +66,12 @@ async fn main() -> std::io::Result<()> {
     // 使用 .service() 或 .route() 但保持一致的语法
     HttpServer::new(move || {
         App::new()
+
+        .wrap(
+              Cors::default().allow_any_origin().allow_any_method().allow_any_header()
+            .supports_credentials()
+        )
+        
             .app_data(db_state.clone())
             // 健康检查
             .route("/health", web::get().to(health_check))
