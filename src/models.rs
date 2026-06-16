@@ -70,7 +70,7 @@ pub struct Claims {
     pub exp: usize,       // 过期时间戳
 }
 
-// ========== 座位相关结构体 ==========
+/// ========== 座位相关结构体 ==========
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Seat {
     pub id: i32,
@@ -108,10 +108,87 @@ pub struct GetSeatsQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct AvailableSeatsQuery {
-    pub start_time: Option<String>, // ISO 8601格式
+    pub start_time: Option<String>,
     pub end_time: Option<String>,
 }
 
+// ========== 新增扩展结构体（新功能） ==========
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SeatInfo {
+    pub id: i32,
+    pub seat_number: String,
+    pub area: String,
+    pub floor: i32,
+    pub room: Option<String>,
+    pub is_near_socket: bool,
+    pub is_near_window: bool,
+    pub is_quiet_zone: bool,
+    pub seat_type: String,
+    pub status: String,
+    pub x_coord: Option<i32>,
+    pub y_coord: Option<i32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSeatRequestExtended {
+    pub seat_number: String,
+    pub area: String,
+    pub floor: Option<i32>,
+    pub room: Option<String>,
+    pub is_near_socket: Option<bool>,
+    pub is_near_window: Option<bool>,
+    pub is_quiet_zone: Option<bool>,
+    pub seat_type: Option<String>,
+    pub x_coord: Option<i32>,
+    pub y_coord: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSeatRequestExtended {
+    pub seat_number: Option<String>,
+    pub area: Option<String>,
+    pub floor: Option<i32>,
+    pub room: Option<String>,
+    pub is_near_socket: Option<bool>,
+    pub is_near_window: Option<bool>,
+    pub is_quiet_zone: Option<bool>,
+    pub seat_type: Option<String>,
+    pub status: Option<String>,
+    pub x_coord: Option<i32>,
+    pub y_coord: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SeatQueryParams {
+    pub area: Option<String>,
+    pub floor: Option<i32>,
+    pub room: Option<String>,
+    pub is_near_socket: Option<bool>,
+    pub is_near_window: Option<bool>,
+    pub is_quiet_zone: Option<bool>,
+    pub seat_type: Option<String>,
+    pub status: Option<String>,
+}
+
+// 楼层统计
+#[derive(Debug, Serialize)]
+pub struct FloorStats {
+    pub floor: i32,
+    pub total_seats: i32,
+    pub available_seats: i32,
+    pub occupied_seats: i32,
+}
+
+// 会议室信息
+#[derive(Debug, Serialize)]
+pub struct RoomInfo {
+    pub room: String,
+    pub floor: i32,
+    pub total_seats: i32,
+    pub available_seats: i32,
+}
 // ========== 预约相关结构体 ==========
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Reservation {

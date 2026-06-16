@@ -17,6 +17,8 @@ use seat_handler::{
     create_seat,
     update_seat,
     delete_seat,
+    get_floor_stats,
+    get_rooms,
 };
 
 use user_handler::{
@@ -82,6 +84,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/seats", web::post().to(create_seat))
             .route("/api/seats/{id}", web::put().to(update_seat))
             .route("/api/seats/{id}", web::delete().to(delete_seat))
+            .route("/api/seats/floors", web::get().to(get_floor_stats))     // 楼层统计
+            .route("/api/seats/rooms", web::get().to(get_rooms))            // 会议室列表
             // ========== 用户管理接口 ==========
             .route("/api/auth/register", web::post().to(register))
             .route("/api/auth/login", web::post().to(login))
@@ -124,11 +128,22 @@ fn init_database(conn: &rusqlite::Connection) {
     ).expect("Failed to create users table");
 
     // 创建 seats 表
+        conn.execute(
+        "DROP TABLE IF EXISTS seats",
+        [],
+    ).ok();
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS seats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             seat_number TEXT NOT NULL UNIQUE,
             area TEXT NOT NULL,
+            floor INTEGER DEFAULT 1,              -- 楼层
+            room TEXT,                            -- 会议室/房间号
+            is_near_socket BOOLEAN DEFAULT 0,     -- 是否靠近插座
+            is_near_window BOOLEAN DEFAULT 0,     -- 是否靠窗
+            is_quiet_zone BOOLEAN DEFAULT 0,      -- 是否静音区
+            seat_type TEXT DEFAULT 'standard',    -- 座位类型: standard, meeting, lounge
             status TEXT NOT NULL DEFAULT 'available',
             x_coord INTEGER,
             y_coord INTEGER,
@@ -204,5 +219,47 @@ fn init_database(conn: &rusqlite::Connection) {
         );
     }
 
+    // 插入测试座位数据（扩展版）
+    let test_seats = vec![
+    // 1楼
+        ("A101", "A区", 1, Some("会议室101"), true, false, false, "standard", 100, 100),
+        ("A102", "A区", 1, Some("会议室101"), true, false, false, "standard", 150, 100),
+        ("A103", "A区", 1, Some("会议室101"), false, true, false, "standard", 200, 100),
+        ("A104", "A区", 1, None, true, false, true, "quiet", 250, 100),
+        ("A105", "A区", 1, None, false, true, true, "quiet", 300, 100),
+    // 2楼
+        ("B201", "B区", 2, Some("会议室201"), true, false, false, "meeting", 100, 200),
+        ("B202", "B区", 2, Some("会议室201"), true, false, false, "meeting", 150, 200),
+        ("B203", "B区", 2, Some("会议室201"), false, true, false, "meeting", 200, 200),
+        ("B204", "B区", 2, None, true, false, false, "standard", 250, 200),
+        ("B205", "B区", 2, None, false, true, false, "standard", 300, 200),
+    // 3楼 - 静音区
+        ("C301", "C区", 3, None, true, false, true, "quiet", 100, 300),
+        ("C302", "C区", 3, None, true, false, true, "quiet", 150, 300),
+        ("C303", "C区", 3, None, false, true, true, "quiet", 200, 300),
+        ("C304", "C区", 3, None, false, true, true, "quiet", 250, 300),
+        ("C305", "C区", 3, None, false, true, true, "quiet", 300, 300),
+    ];
+
+    for (seat_num, area, floor, room, near_socket, near_window, quiet_zone, seat_type, x, y) in test_seats {
+        let room_str = room.map(|r| r.to_string());
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO seats 
+            (seat_number, area, floor, room, is_near_socket, is_near_window, 
+            is_quiet_zone, seat_type, x_coord, y_coord, created_at, updated_at) 
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            [
+                seat_num, area, &floor.to_string(), 
+                &room_str.as_deref().unwrap_or(""),
+                &(near_socket as i32).to_string(),
+                &(near_window as i32).to_string(),
+                &(quiet_zone as i32).to_string(),
+                seat_type,
+                &x.to_string(),
+                &y.to_string(),
+                &now,
+            ],
+        );
+    }
     println!("✅ 数据库初始化成功，文件: library.db");
 }

@@ -1,4 +1,4 @@
-// seat_handler.rs - 简化版本，避免复杂的动态参数
+// seat_handler.rs - 不修改 models.rs 的版本
 
 use actix_web::{web, HttpResponse, Responder};
 use chrono::Utc;
@@ -6,48 +6,102 @@ use rusqlite::{Connection, params};
 use std::sync::Mutex;
 
 use crate::models::{
-    ApiResponse, CreateSeatRequest, GetSeatsQuery, Seat, UpdateSeatRequest,
+    ApiResponse, 
+    CreateSeatRequest, 
+    CreateSeatRequestExtended,
+    UpdateSeatRequest,
+    UpdateSeatRequestExtended,
+    GetSeatsQuery, 
+    Seat, 
+    SeatInfo,
+    FloorStats, 
+    RoomInfo, 
+    SeatQueryParams,
     AvailableSeatsQuery,
 };
 
-/// 获取所有座位列表（支持按区域、状态筛选）
+/// 获取所有座位列表（支持扩展筛选）
 pub async fn get_seats(
-    query: web::Query<GetSeatsQuery>,
+    query: web::Query<SeatQueryParams>,
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
     let conn = db.lock().unwrap();
     
-    // 简化：根据是否有参数使用不同的查询
-    let (sql, params_vec) = if query.area.is_some() || query.status.is_some() {
-        let mut sql = String::from(
-            "SELECT id, seat_number, area, status, x_coord, y_coord, created_at, updated_at FROM seats WHERE 1=1"
-        );
-        let mut params: Vec<String> = Vec::new();
-        
-        if let Some(area) = &query.area {
-            sql.push_str(" AND area = ?");
-            params.push(area.clone());
-        }
-        
-        if let Some(status) = &query.status {
-            sql.push_str(" AND status = ?");
-            params.push(status.clone());
-        }
-        
-        sql.push_str(" ORDER BY area, seat_number");
-        (sql, params)
+    // 检查是否有扩展列
+    let has_extended = conn.query_row(
+        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    let mut sql = if has_extended {
+        String::from(
+            "SELECT id, seat_number, area, floor, room, is_near_socket, is_near_window, 
+             is_quiet_zone, seat_type, status, x_coord, y_coord, created_at, updated_at 
+             FROM seats WHERE 1=1"
+        )
     } else {
-        (
-            "SELECT id, seat_number, area, status, x_coord, y_coord, created_at, updated_at FROM seats ORDER BY area, seat_number".to_string(),
-            vec![]
+        String::from(
+            "SELECT id, seat_number, area, status, x_coord, y_coord, created_at, updated_at 
+             FROM seats WHERE 1=1"
         )
     };
+    
+    let mut params_vec: Vec<String> = Vec::new();
+    
+    // 公共筛选
+    if let Some(area) = &query.area {
+        sql.push_str(" AND area = ?");
+        params_vec.push(area.clone());
+    }
+    
+    if let Some(status) = &query.status {
+        sql.push_str(" AND status = ?");
+        params_vec.push(status.clone());
+    }
+    
+    // 扩展筛选
+    if has_extended {
+        if let Some(floor) = &query.floor {
+            sql.push_str(" AND floor = ?");
+            params_vec.push(floor.to_string());
+        }
+        
+        if let Some(room) = &query.room {
+            sql.push_str(" AND room = ?");
+            params_vec.push(room.clone());
+        }
+        
+        if let Some(near_socket) = &query.is_near_socket {
+            sql.push_str(" AND is_near_socket = ?");
+            params_vec.push(if *near_socket { "1" } else { "0" }.to_string());
+        }
+        
+        if let Some(near_window) = &query.is_near_window {
+            sql.push_str(" AND is_near_window = ?");
+            params_vec.push(if *near_window { "1" } else { "0" }.to_string());
+        }
+        
+        if let Some(quiet_zone) = &query.is_quiet_zone {
+            sql.push_str(" AND is_quiet_zone = ?");
+            params_vec.push(if *quiet_zone { "1" } else { "0" }.to_string());
+        }
+        
+        if let Some(seat_type) = &query.seat_type {
+            sql.push_str(" AND seat_type = ?");
+            params_vec.push(seat_type.clone());
+        }
+        
+        sql.push_str(" ORDER BY floor, area, seat_number");
+    } else {
+        sql.push_str(" ORDER BY area, seat_number");
+    }
     
     let mut stmt = match conn.prepare(&sql) {
         Ok(stmt) => stmt,
         Err(e) => {
             eprintln!("准备查询失败: {}", e);
-            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<SeatInfo>> {
                 success: false,
                 message: "服务器内部错误".to_string(),
                 data: None,
@@ -55,63 +109,133 @@ pub async fn get_seats(
         }
     };
     
-    // 使用不同的查询方法避免闭包类型问题
-    let seats: Vec<Seat> = if params_vec.is_empty() {
-        let rows = stmt.query_map([], |row| {
-            Ok(Seat {
-                id: row.get(0)?,
-                seat_number: row.get(1)?,
-                area: row.get(2)?,
-                status: row.get(3)?,
-                x_coord: row.get(4)?,
-                y_coord: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        });
-        match rows {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                eprintln!("查询失败: {}", e);
-                return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
-                    success: false,
-                    message: "服务器内部错误".to_string(),
-                    data: None,
-                });
-            }
-        }
-    } else {
-        let param_refs: Vec<&str> = params_vec.iter().map(|s| s.as_str()).collect();
-        let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), |row| {
-            Ok(Seat {
-                id: row.get(0)?,
-                seat_number: row.get(1)?,
-                area: row.get(2)?,
-                status: row.get(3)?,
-                x_coord: row.get(4)?,
-                y_coord: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        });
-        match rows {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                eprintln!("查询失败: {}", e);
-                return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
-                    success: false,
-                    message: "服务器内部错误".to_string(),
-                    data: None,
-                });
-            }
-        }
-    };
+    let param_refs: Vec<&str> = params_vec.iter().map(|s| s.as_str()).collect();
     
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        message: format!("共 {} 个座位", seats.len()),
-        data: Some(seats),
-    })
+    if has_extended {
+        let rows = if params_vec.is_empty() {
+            match stmt.query_map([], |row| {
+                Ok(SeatInfo {
+                    id: row.get(0)?,
+                    seat_number: row.get(1)?,
+                    area: row.get(2)?,
+                    floor: row.get(3)?,
+                    room: row.get(4)?,
+                    is_near_socket: row.get(5).unwrap_or(false),
+                    is_near_window: row.get(6).unwrap_or(false),
+                    is_quiet_zone: row.get(7).unwrap_or(false),
+                    seat_type: row.get(8).unwrap_or("standard".to_string()),
+                    status: row.get(9)?,
+                    x_coord: row.get(10)?,
+                    y_coord: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
+                })
+            }) {
+                Ok(rows) => rows.collect::<Vec<_>>(),
+                Err(e) => {
+                    eprintln!("查询失败: {}", e);
+                    return HttpResponse::InternalServerError().json(ApiResponse::<Vec<SeatInfo>> {
+                        success: false,
+                        message: "服务器内部错误".to_string(),
+                        data: None,
+                    });
+                }
+            }
+        } else {
+            match stmt.query_map(rusqlite::params_from_iter(param_refs), |row| {
+                Ok(SeatInfo {
+                    id: row.get(0)?,
+                    seat_number: row.get(1)?,
+                    area: row.get(2)?,
+                    floor: row.get(3)?,
+                    room: row.get(4)?,
+                    is_near_socket: row.get(5).unwrap_or(false),
+                    is_near_window: row.get(6).unwrap_or(false),
+                    is_quiet_zone: row.get(7).unwrap_or(false),
+                    seat_type: row.get(8).unwrap_or("standard".to_string()),
+                    status: row.get(9)?,
+                    x_coord: row.get(10)?,
+                    y_coord: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
+                })
+            }) {
+                Ok(rows) => rows.collect::<Vec<_>>(),
+                Err(e) => {
+                    eprintln!("查询失败: {}", e);
+                    return HttpResponse::InternalServerError().json(ApiResponse::<Vec<SeatInfo>> {
+                        success: false,
+                        message: "服务器内部错误".to_string(),
+                        data: None,
+                    });
+                }
+            }
+        };
+        
+        let seats: Vec<SeatInfo> = rows.into_iter().filter_map(|r| r.ok()).collect();
+        
+        HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: format!("共 {} 个座位", seats.len()),
+            data: Some(seats),
+        })
+    } else {
+        let rows = if params_vec.is_empty() {
+            match stmt.query_map([], |row| {
+                Ok(Seat {
+                    id: row.get(0)?,
+                    seat_number: row.get(1)?,
+                    area: row.get(2)?,
+                    status: row.get(3)?,
+                    x_coord: row.get(4)?,
+                    y_coord: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            }) {
+                Ok(rows) => rows.collect::<Vec<_>>(),
+                Err(e) => {
+                    eprintln!("查询失败: {}", e);
+                    return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
+                        success: false,
+                        message: "服务器内部错误".to_string(),
+                        data: None,
+                    });
+                }
+            }
+        } else {
+            match stmt.query_map(rusqlite::params_from_iter(param_refs), |row| {
+                Ok(Seat {
+                    id: row.get(0)?,
+                    seat_number: row.get(1)?,
+                    area: row.get(2)?,
+                    status: row.get(3)?,
+                    x_coord: row.get(4)?,
+                    y_coord: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            }) {
+                Ok(rows) => rows.collect::<Vec<_>>(),
+                Err(e) => {
+                    eprintln!("查询失败: {}", e);
+                    return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
+                        success: false,
+                        message: "服务器内部错误".to_string(),
+                        data: None,
+                    });
+                }
+            }
+        };
+        
+        let seats: Vec<Seat> = rows.into_iter().filter_map(|r| r.ok()).collect();
+        
+        HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: format!("共 {} 个座位", seats.len()),
+            data: Some(seats),
+        })
+    }
 }
 
 /// 获取单个座位详细信息
@@ -122,6 +246,68 @@ pub async fn get_seat_by_id(
     let seat_id = seat_id.into_inner();
     let conn = db.lock().unwrap();
     
+    let has_extended = conn.query_row(
+        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    if has_extended {
+        let mut stmt = match conn.prepare(
+            "SELECT id, seat_number, area, floor, room, is_near_socket, is_near_window, 
+             is_quiet_zone, seat_type, status, x_coord, y_coord, created_at, updated_at 
+             FROM seats WHERE id = ?1"
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("准备查询失败: {}", e);
+                return HttpResponse::InternalServerError().json(ApiResponse::<SeatInfo> {
+                    success: false,
+                    message: "服务器内部错误".to_string(),
+                    data: None,
+                });
+            }
+        };
+        
+        let mut rows = match stmt.query(params![seat_id]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("查询失败: {}", e);
+                return HttpResponse::InternalServerError().json(ApiResponse::<SeatInfo> {
+                    success: false,
+                    message: "服务器内部错误".to_string(),
+                    data: None,
+                });
+            }
+        };
+        
+        if let Some(row) = rows.next().unwrap() {
+            let seat = SeatInfo {
+                id: row.get(0).unwrap(),
+                seat_number: row.get(1).unwrap(),
+                area: row.get(2).unwrap(),
+                floor: row.get(3).unwrap(),
+                room: row.get(4).unwrap(),
+                is_near_socket: row.get(5).unwrap_or(false),
+                is_near_window: row.get(6).unwrap_or(false),
+                is_quiet_zone: row.get(7).unwrap_or(false),
+                seat_type: row.get(8).unwrap_or("standard".to_string()),
+                status: row.get(9).unwrap(),
+                x_coord: row.get(10).unwrap(),
+                y_coord: row.get(11).unwrap(),
+                created_at: row.get(12).unwrap(),
+                updated_at: row.get(13).unwrap(),
+            };
+            
+            return HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                message: "获取成功".to_string(),
+                data: Some(seat),
+            });
+        }
+    }
+    
+    // 基础模式
     let mut stmt = match conn.prepare(
         "SELECT id, seat_number, area, status, x_coord, y_coord, created_at, updated_at FROM seats WHERE id = ?1"
     ) {
@@ -180,22 +366,45 @@ pub async fn get_available_seats(
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
     let conn = db.lock().unwrap();
-    
     let now = Utc::now().to_rfc3339();
     
-    let sql = r#"
-        SELECT s.id, s.seat_number, s.area, s.status, s.x_coord, s.y_coord, s.created_at, s.updated_at 
-        FROM seats s
-        WHERE s.status = 'available'
-        AND NOT EXISTS (
-            SELECT 1 FROM reservations r 
-            WHERE r.seat_id = s.id 
-            AND r.status IN ('pending', 'active')
-            AND r.start_time <= ?2
-            AND r.end_time >= ?1
-        )
-        ORDER BY s.area, s.seat_number
-    "#;
+    let has_extended = conn.query_row(
+        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    let sql = if has_extended {
+        r#"
+            SELECT s.id, s.seat_number, s.area, s.floor, s.room, s.is_near_socket, 
+                   s.is_near_window, s.is_quiet_zone, s.seat_type, s.status, 
+                   s.x_coord, s.y_coord, s.created_at, s.updated_at 
+            FROM seats s
+            WHERE s.status = 'available'
+            AND NOT EXISTS (
+                SELECT 1 FROM reservations r 
+                WHERE r.seat_id = s.id 
+                AND r.status IN ('pending', 'active')
+                AND r.start_time <= ?2
+                AND r.end_time >= ?1
+            )
+            ORDER BY s.floor, s.area, s.seat_number
+        "#
+    } else {
+        r#"
+            SELECT s.id, s.seat_number, s.area, s.status, s.x_coord, s.y_coord, s.created_at, s.updated_at 
+            FROM seats s
+            WHERE s.status = 'available'
+            AND NOT EXISTS (
+                SELECT 1 FROM reservations r 
+                WHERE r.seat_id = s.id 
+                AND r.status IN ('pending', 'active')
+                AND r.start_time <= ?2
+                AND r.end_time >= ?1
+            )
+            ORDER BY s.area, s.seat_number
+        "#
+    };
     
     let start_time = query.start_time.as_ref().unwrap_or(&now);
     let end_time = query.end_time.as_ref().unwrap_or(&now);
@@ -204,7 +413,7 @@ pub async fn get_available_seats(
         Ok(stmt) => stmt,
         Err(e) => {
             eprintln!("准备查询失败: {}", e);
-            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<SeatInfo>> {
                 success: false,
                 message: "服务器内部错误".to_string(),
                 data: None,
@@ -212,22 +421,132 @@ pub async fn get_available_seats(
         }
     };
     
-    let rows = match stmt.query_map(params![start_time, end_time], |row| {
-        Ok(Seat {
-            id: row.get(0)?,
-            seat_number: row.get(1)?,
-            area: row.get(2)?,
-            status: row.get(3)?,
-            x_coord: row.get(4)?,
-            y_coord: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+    if has_extended {
+        let rows = match stmt.query_map(params![start_time, end_time], |row| {
+            Ok(SeatInfo {
+                id: row.get(0)?,
+                seat_number: row.get(1)?,
+                area: row.get(2)?,
+                floor: row.get(3)?,
+                room: row.get(4)?,
+                is_near_socket: row.get(5).unwrap_or(false),
+                is_near_window: row.get(6).unwrap_or(false),
+                is_quiet_zone: row.get(7).unwrap_or(false),
+                seat_type: row.get(8).unwrap_or("standard".to_string()),
+                status: row.get(9)?,
+                x_coord: row.get(10)?,
+                y_coord: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("查询失败: {}", e);
+                return HttpResponse::InternalServerError().json(ApiResponse::<Vec<SeatInfo>> {
+                    success: false,
+                    message: "服务器内部错误".to_string(),
+                    data: None,
+                });
+            }
+        };
+        
+        let seats: Vec<SeatInfo> = rows.filter_map(|r| r.ok()).collect();
+        
+        HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: format!("当前共有 {} 个空闲座位", seats.len()),
+            data: Some(seats),
+        })
+    } else {
+        let rows = match stmt.query_map(params![start_time, end_time], |row| {
+            Ok(Seat {
+                id: row.get(0)?,
+                seat_number: row.get(1)?,
+                area: row.get(2)?,
+                status: row.get(3)?,
+                x_coord: row.get(4)?,
+                y_coord: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("查询失败: {}", e);
+                return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
+                    success: false,
+                    message: "服务器内部错误".to_string(),
+                    data: None,
+                });
+            }
+        };
+        
+        let seats: Vec<Seat> = rows.filter_map(|r| r.ok()).collect();
+        
+        HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: format!("当前共有 {} 个空闲座位", seats.len()),
+            data: Some(seats),
+        })
+    }
+}
+
+/// 获取楼层统计
+pub async fn get_floor_stats(
+    db: web::Data<Mutex<Connection>>,
+) -> impl Responder {
+    let conn = db.lock().unwrap();
+    
+    let has_floor = conn.query_row(
+        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    if !has_floor {
+        return HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: "暂无楼层数据".to_string(),
+            data: Some(Vec::<FloorStats>::new()),
+        });
+    }
+    
+    let sql = r#"
+        SELECT 
+            floor,
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) as available,
+            SUM(CASE WHEN status = 'occupied' THEN 1 ELSE 0 END) as occupied
+        FROM seats
+        GROUP BY floor
+        ORDER BY floor
+    "#;
+    
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("准备查询失败: {}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<FloorStats>> {
+                success: false,
+                message: "服务器内部错误".to_string(),
+                data: None,
+            });
+        }
+    };
+    
+    let rows = match stmt.query_map([], |row| {
+        Ok(FloorStats {
+            floor: row.get(0)?,
+            total_seats: row.get(1)?,
+            available_seats: row.get(2)?,
+            occupied_seats: row.get(3)?,
         })
     }) {
         Ok(rows) => rows,
         Err(e) => {
             eprintln!("查询失败: {}", e);
-            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<Seat>> {
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<FloorStats>> {
                 success: false,
                 message: "服务器内部错误".to_string(),
                 data: None,
@@ -235,64 +554,190 @@ pub async fn get_available_seats(
         }
     };
     
-    let seats: Vec<Seat> = rows.filter_map(|r| r.ok()).collect();
+    let stats: Vec<FloorStats> = rows.filter_map(|r| r.ok()).collect();
     
     HttpResponse::Ok().json(ApiResponse {
         success: true,
-        message: format!("当前共有 {} 个空闲座位", seats.len()),
-        data: Some(seats),
+        message: format!("共 {} 层", stats.len()),
+        data: Some(stats),
     })
 }
 
-/// 管理员添加座位
+/// 获取会议室列表
+pub async fn get_rooms(
+    db: web::Data<Mutex<Connection>>,
+) -> impl Responder {
+    let conn = db.lock().unwrap();
+    
+    let has_room = conn.query_row(
+        "SELECT 1 FROM seats WHERE room IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    if !has_room {
+        return HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: "暂无会议室数据".to_string(),
+            data: Some(Vec::<RoomInfo>::new()),
+        });
+    }
+    
+    let sql = r#"
+        SELECT 
+            room,
+            floor,
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) as available
+        FROM seats
+        WHERE room IS NOT NULL AND room != ''
+        GROUP BY room, floor
+        ORDER BY floor, room
+    "#;
+    
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("准备查询失败: {}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<RoomInfo>> {
+                success: false,
+                message: "服务器内部错误".to_string(),
+                data: None,
+            });
+        }
+    };
+    
+    let rows = match stmt.query_map([], |row| {
+        Ok(RoomInfo {
+            room: row.get(0)?,
+            floor: row.get(1)?,
+            total_seats: row.get(2)?,
+            available_seats: row.get(3)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("查询失败: {}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<RoomInfo>> {
+                success: false,
+                message: "服务器内部错误".to_string(),
+                data: None,
+            });
+        }
+    };
+    
+    let rooms: Vec<RoomInfo> = rows.filter_map(|r| r.ok()).collect();
+    
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: format!("共 {} 个会议室", rooms.len()),
+        data: Some(rooms),
+    })
+}
+
+/// 管理员添加座位 - 使用扩展版本
 pub async fn create_seat(
-    req: web::Json<CreateSeatRequest>,
+    req: web::Json<CreateSeatRequestExtended>,
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
     let now = Utc::now().to_rfc3339();
     let conn = db.lock().unwrap();
     
-    // 直接使用 Option 值，params! 可以处理 Option
-    match conn.execute(
-        "INSERT INTO seats (seat_number, area, status, x_coord, y_coord, created_at, updated_at) 
-         VALUES (?1, ?2, 'available', ?3, ?4, ?5, ?5)",
-        params![&req.seat_number, &req.area, req.x_coord, req.y_coord, &now],
-    ) {
-        Ok(_) => HttpResponse::Ok().json(ApiResponse::<()> {
-            success: true,
-            message: "座位添加成功".to_string(),
-            data: None,
-        }),
-        Err(e) => {
-            if e.to_string().contains("UNIQUE") {
-                HttpResponse::BadRequest().json(ApiResponse::<()> {
-                    success: false,
-                    message: "座位号已存在".to_string(),
-                    data: None,
-                })
-            } else {
-                eprintln!("添加座位失败: {}", e);
-                HttpResponse::InternalServerError().json(ApiResponse::<()> {
-                    success: false,
-                    message: "添加座位失败".to_string(),
-                    data: None,
-                })
+    let has_extended = conn.query_row(
+        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    if has_extended {
+        let floor = req.floor.unwrap_or(1);
+        let is_near_socket = req.is_near_socket.unwrap_or(false);
+        let is_near_window = req.is_near_window.unwrap_or(false);
+        let is_quiet_zone = req.is_quiet_zone.unwrap_or(false);
+        let seat_type = req.seat_type.clone().unwrap_or("standard".to_string());
+        
+        match conn.execute(
+            "INSERT INTO seats (seat_number, area, floor, room, is_near_socket, is_near_window, 
+             is_quiet_zone, seat_type, status, x_coord, y_coord, created_at, updated_at) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9, ?10, ?11, ?11)",
+            params![
+                &req.seat_number, &req.area, &floor, &req.room, 
+                &(is_near_socket as i32), &(is_near_window as i32), 
+                &(is_quiet_zone as i32), &seat_type,
+                &req.x_coord, &req.y_coord, &now
+            ],
+        ) {
+            Ok(_) => HttpResponse::Ok().json(ApiResponse::<()> {
+                success: true,
+                message: "座位添加成功".to_string(),
+                data: None,
+            }),
+            Err(e) => {
+                if e.to_string().contains("UNIQUE") {
+                    HttpResponse::BadRequest().json(ApiResponse::<()> {
+                        success: false,
+                        message: "座位号已存在".to_string(),
+                        data: None,
+                    })
+                } else {
+                    eprintln!("添加座位失败: {}", e);
+                    HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                        success: false,
+                        message: "添加座位失败".to_string(),
+                        data: None,
+                    })
+                }
+            }
+        }
+    } else {
+        // 使用基础字段（兼容旧版本）
+        match conn.execute(
+            "INSERT INTO seats (seat_number, area, status, x_coord, y_coord, created_at, updated_at) 
+             VALUES (?1, ?2, 'available', ?3, ?4, ?5, ?5)",
+            params![&req.seat_number, &req.area, &req.x_coord, &req.y_coord, &now],
+        ) {
+            Ok(_) => HttpResponse::Ok().json(ApiResponse::<()> {
+                success: true,
+                message: "座位添加成功".to_string(),
+                data: None,
+            }),
+            Err(e) => {
+                if e.to_string().contains("UNIQUE") {
+                    HttpResponse::BadRequest().json(ApiResponse::<()> {
+                        success: false,
+                        message: "座位号已存在".to_string(),
+                        data: None,
+                    })
+                } else {
+                    eprintln!("添加座位失败: {}", e);
+                    HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                        success: false,
+                        message: "添加座位失败".to_string(),
+                        data: None,
+                    })
+                }
             }
         }
     }
 }
 
-/// 管理员修改座位信息
+/// 管理员修改座位信息 - 使用扩展版本
 pub async fn update_seat(
     seat_id: web::Path<i32>,
-    req: web::Json<UpdateSeatRequest>,
+    req: web::Json<UpdateSeatRequestExtended>,
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
     let seat_id = seat_id.into_inner();
     let now = Utc::now().to_rfc3339();
     let conn = db.lock().unwrap();
     
-    // 简化：分别处理每个字段的更新
+    let has_extended = conn.query_row(
+        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    // 基础字段更新
     if let Some(seat_number) = &req.seat_number {
         let _ = conn.execute(
             "UPDATE seats SET seat_number = ?1, updated_at = ?2 WHERE id = ?3",
@@ -326,6 +771,51 @@ pub async fn update_seat(
             "UPDATE seats SET y_coord = ?1, updated_at = ?2 WHERE id = ?3",
             params![y_coord, &now, seat_id],
         );
+    }
+    
+    // 扩展字段更新
+    if has_extended {
+        if let Some(floor) = &req.floor {
+            let _ = conn.execute(
+                "UPDATE seats SET floor = ?1, updated_at = ?2 WHERE id = ?3",
+                params![floor, &now, seat_id],
+            );
+        }
+        
+        if let Some(room) = &req.room {
+            let _ = conn.execute(
+                "UPDATE seats SET room = ?1, updated_at = ?2 WHERE id = ?3",
+                params![room, &now, seat_id],
+            );
+        }
+        
+        if let Some(is_near_socket) = &req.is_near_socket {
+            let _ = conn.execute(
+                "UPDATE seats SET is_near_socket = ?1, updated_at = ?2 WHERE id = ?3",
+                params![&(*is_near_socket as i32), &now, seat_id],
+            );
+        }
+        
+        if let Some(is_near_window) = &req.is_near_window {
+            let _ = conn.execute(
+                "UPDATE seats SET is_near_window = ?1, updated_at = ?2 WHERE id = ?3",
+                params![&(*is_near_window as i32), &now, seat_id],
+            );
+        }
+        
+        if let Some(is_quiet_zone) = &req.is_quiet_zone {
+            let _ = conn.execute(
+                "UPDATE seats SET is_quiet_zone = ?1, updated_at = ?2 WHERE id = ?3",
+                params![&(*is_quiet_zone as i32), &now, seat_id],
+            );
+        }
+        
+        if let Some(seat_type) = &req.seat_type {
+            let _ = conn.execute(
+                "UPDATE seats SET seat_type = ?1, updated_at = ?2 WHERE id = ?3",
+                params![seat_type, &now, seat_id],
+            );
+        }
     }
     
     // 检查座位是否存在
