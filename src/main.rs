@@ -4,8 +4,8 @@ mod user_handler;
 mod seat_handler;
 mod reservation_handler;
 mod attendance_handler;
-use actix_cors::Cors;
 
+use actix_cors::Cors;
 use actix_web::{web, App, HttpServer, HttpResponse, Responder};
 use std::sync::Mutex;
 
@@ -19,6 +19,7 @@ use seat_handler::{
     delete_seat,
     get_floor_stats,
     get_rooms,
+    get_room_stats,
 };
 
 use user_handler::{
@@ -65,15 +66,15 @@ async fn main() -> std::io::Result<()> {
 
     println!("Server starting at http://127.0.0.1:8080");
 
-    // 使用 .service() 或 .route() 但保持一致的语法
     HttpServer::new(move || {
         App::new()
-
-        .wrap(
-              Cors::default().allow_any_origin().allow_any_method().allow_any_header()
-            .supports_credentials()
-        )
-        
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .supports_credentials()
+            )
             .app_data(db_state.clone())
             // 健康检查
             .route("/health", web::get().to(health_check))
@@ -84,8 +85,9 @@ async fn main() -> std::io::Result<()> {
             .route("/api/seats", web::post().to(create_seat))
             .route("/api/seats/{id}", web::put().to(update_seat))
             .route("/api/seats/{id}", web::delete().to(delete_seat))
-            .route("/api/seats/floors", web::get().to(get_floor_stats))     // 楼层统计
-            .route("/api/seats/rooms", web::get().to(get_rooms))            // 会议室列表
+            .route("/api/seats/floors", web::get().to(get_floor_stats))
+            .route("/api/seats/rooms", web::get().to(get_rooms))
+            .route("/api/seats/rooms/stats", web::get().to(get_room_stats))  // 新增房间统计
             // ========== 用户管理接口 ==========
             .route("/api/auth/register", web::post().to(register))
             .route("/api/auth/login", web::post().to(login))
@@ -94,17 +96,13 @@ async fn main() -> std::io::Result<()> {
             .route("/api/users/password/{student_id}", web::put().to(change_password))
             .route("/api/users", web::get().to(get_all_users))
             // ========== 预约管理接口 ==========
-            // 注意：这些接口的 user_id 应该从 JWT token 中获取，这里暂时作为路径参数
             .route("/api/reservations", web::post().to(create_reservation))
-            //.route("/api/reservations", web::get().to(get_my_reservations))
-            //.route("/api/reservations/{id}", web::get().to(get_reservation_detail))
             .route("/api/reservations/{id}", web::delete().to(cancel_reservation))
-            //.route("/api/reservations/{id}/extend", web::put().to(extend_reservation))
             // ========== 签到签退接口 ==========
             .route("/api/checkin", web::post().to(checkin))
             .route("/api/checkout", web::post().to(checkout))
             .route("/api/attendance/status", web::get().to(get_attendance_status))
-         })
+    })
     .bind("127.0.0.1:8080")?
     .run()
     .await
@@ -127,8 +125,8 @@ fn init_database(conn: &rusqlite::Connection) {
         [],
     ).expect("Failed to create users table");
 
-    // 创建 seats 表
-        conn.execute(
+    // 删除旧表并创建新 seats 表
+    conn.execute(
         "DROP TABLE IF EXISTS seats",
         [],
     ).ok();
@@ -138,12 +136,13 @@ fn init_database(conn: &rusqlite::Connection) {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             seat_number TEXT NOT NULL UNIQUE,
             area TEXT NOT NULL,
-            floor INTEGER DEFAULT 1,              -- 楼层
-            room TEXT,                            -- 会议室/房间号
-            is_near_socket BOOLEAN DEFAULT 0,     -- 是否靠近插座
-            is_near_window BOOLEAN DEFAULT 0,     -- 是否靠窗
-            is_quiet_zone BOOLEAN DEFAULT 0,      -- 是否静音区
-            seat_type TEXT DEFAULT 'standard',    -- 座位类型: standard, meeting, lounge
+            floor INTEGER DEFAULT 1,
+            room_type TEXT DEFAULT 'hall',      -- hall, large, medium, small
+            room_name TEXT,                     -- 大厅, 大自习室, 中自习室, 小自习室
+            is_near_socket BOOLEAN DEFAULT 0,
+            is_near_window BOOLEAN DEFAULT 0,
+            is_quiet_zone BOOLEAN DEFAULT 0,
+            seat_type TEXT DEFAULT 'standard',
             status TEXT NOT NULL DEFAULT 'available',
             x_coord INTEGER,
             y_coord INTEGER,
@@ -186,10 +185,9 @@ fn init_database(conn: &rusqlite::Connection) {
         )",
         [],
     ).expect("Failed to create attendance table");
-    // main.rs - init_database 函数中添加
 
-    // 插入管理员账号（密码是 admin123 的 bcrypt hash）
-    let admin_hash = "$2b$12$2Yq4uQkE5ZvXxV5Yq4uQkE"; // 实际应该用正确的 hash
+    // 插入管理员账号
+    let admin_hash = "$2b$12$2Yq4uQkE5ZvXxV5Yq4uQkE";
     let now = chrono::Utc::now().to_rfc3339();
     let _ = conn.execute(
         "INSERT OR IGNORE INTO users (student_id, username, password_hash, email, phone, role, created_at) 
@@ -197,69 +195,70 @@ fn init_database(conn: &rusqlite::Connection) {
         [admin_hash, &now],
     );
     
-    // 插入测试座位数据
-    let test_seats = [
-        ("A001", "A区", Some(100), Some(100)),
-        ("A002", "A区", Some(150), Some(100)),
-        ("A003", "A区", Some(200), Some(100)),
-        ("B001", "B区", Some(100), Some(200)),
-        ("B002", "B区", Some(150), Some(200)),
-        ("B003", "B区", Some(200), Some(200)),
-        ("C001", "C区", Some(100), Some(300)),
-        ("C002", "C区", Some(150), Some(300)),
-        ("C003", "C区", Some(200), Some(300)),
-    ];
+    // ========== 插入测试座位数据 ==========
+    let mut seat_counter = 0;
     
-    for (seat_num, area, x, y) in test_seats {
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO seats (seat_number, area, x_coord, y_coord, created_at, updated_at) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            [seat_num, area, &x.map(|v| v.to_string()).unwrap_or_default(), 
-             &y.map(|v| v.to_string()).unwrap_or_default(), &now],
-        );
-    }
-
-    // 插入测试座位数据（扩展版）
-    let test_seats = vec![
-    // 1楼
-        ("A101", "A区", 1, Some("会议室101"), true, false, false, "standard", 100, 100),
-        ("A102", "A区", 1, Some("会议室101"), true, false, false, "standard", 150, 100),
-        ("A103", "A区", 1, Some("会议室101"), false, true, false, "standard", 200, 100),
-        ("A104", "A区", 1, None, true, false, true, "quiet", 250, 100),
-        ("A105", "A区", 1, None, false, true, true, "quiet", 300, 100),
-    // 2楼
-        ("B201", "B区", 2, Some("会议室201"), true, false, false, "meeting", 100, 200),
-        ("B202", "B区", 2, Some("会议室201"), true, false, false, "meeting", 150, 200),
-        ("B203", "B区", 2, Some("会议室201"), false, true, false, "meeting", 200, 200),
-        ("B204", "B区", 2, None, true, false, false, "standard", 250, 200),
-        ("B205", "B区", 2, None, false, true, false, "standard", 300, 200),
-    // 3楼 - 静音区
-        ("C301", "C区", 3, None, true, false, true, "quiet", 100, 300),
-        ("C302", "C区", 3, None, true, false, true, "quiet", 150, 300),
-        ("C303", "C区", 3, None, false, true, true, "quiet", 200, 300),
-        ("C304", "C区", 3, None, false, true, true, "quiet", 250, 300),
-        ("C305", "C区", 3, None, false, true, true, "quiet", 300, 300),
+    // 定义楼层和房间配置
+    // (floor, room_type, room_name, count)
+    let configs = vec![
+        (1, "hall", "大厅", 30),
+        (2, "hall", "大厅", 50),
+        (2, "large", "大自习室", 3),
+        (2, "medium", "中自习室", 4),
+        (2, "small", "小自习室", 5),
+        (3, "hall", "大厅", 50),
+        (3, "large", "大自习室", 3),
+        (3, "medium", "中自习室", 4),
+        (3, "small", "小自习室", 5),
     ];
 
-    for (seat_num, area, floor, room, near_socket, near_window, quiet_zone, seat_type, x, y) in test_seats {
-        let room_str = room.map(|r| r.to_string());
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO seats 
-            (seat_number, area, floor, room, is_near_socket, is_near_window, 
-            is_quiet_zone, seat_type, x_coord, y_coord, created_at, updated_at) 
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-            [
-                seat_num, area, &floor.to_string(), 
-                &room_str.as_deref().unwrap_or(""),
-                &(near_socket as i32).to_string(),
-                &(near_window as i32).to_string(),
-                &(quiet_zone as i32).to_string(),
-                seat_type,
-                &x.to_string(),
-                &y.to_string(),
-                &now,
-            ],
-        );
+    for (floor, room_type, room_name, count) in configs {
+        // 座位编号前缀
+        let prefix = match room_type {
+            "hall" => "H",
+            "large" => "L",
+            "medium" => "M",
+            "small" => "S",
+            _ => "H",
+        };
+        
+        for i in 1..=count {
+            seat_counter += 1;
+            let seat_number = format!("{}{:03}", prefix, seat_counter);
+            let area = format!("{}楼{}", floor, room_name);
+            
+            // 设置座位属性
+            let near_socket = i % 3 == 0;      // 每3个有一个靠近插座
+            let near_window = i % 5 == 0;      // 每5个有一个靠窗
+            let quiet_zone = room_type == "large" || room_type == "medium";  // 大中自习室是静音区
+            
+            let _ = conn.execute(
+                "INSERT INTO seats (seat_number, area, floor, room_type, room_name, 
+                 is_near_socket, is_near_window, is_quiet_zone, seat_type, 
+                 x_coord, y_coord, created_at, updated_at) 
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                [
+                    &seat_number,
+                    &area,
+                    &floor.to_string(),
+                    room_type,
+                    room_name,
+                    &(near_socket as i32).to_string(),
+                    &(near_window as i32).to_string(),
+                    &(quiet_zone as i32).to_string(),
+                    "standard",
+                    &((100 + (i - 1) * 50) % 500).to_string(),
+                    &((100 + ((i - 1) / 10) * 50) % 500).to_string(),
+                    &now,
+                ],
+            );
+        }
     }
-    println!("✅ 数据库初始化成功，文件: library.db");
+
+    println!("✅ 数据库初始化成功，共创建 {} 个座位", seat_counter);
+    println!("📊 座位分布:");
+    println!("  1楼大厅: 30个");
+    println!("  2楼大厅: 50个, 大自习室: 3个, 中自习室: 4个, 小自习室: 5个");
+    println!("  3楼大厅: 50个, 大自习室: 3个, 中自习室: 4个, 小自习室: 5个");
+    println!("  总计: 154个座位");
 }

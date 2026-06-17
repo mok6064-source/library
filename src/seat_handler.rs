@@ -1,4 +1,4 @@
-// seat_handler.rs - 不修改 models.rs 的版本
+// seat_handler.rs
 
 use actix_web::{web, HttpResponse, Responder};
 use chrono::Utc;
@@ -16,31 +16,34 @@ use crate::models::{
     SeatInfo,
     FloorStats, 
     RoomInfo, 
+    RoomStats,
     SeatQueryParams,
     AvailableSeatsQuery,
 };
 
-/// 获取所有座位列表（支持扩展筛选）
+/// 获取所有座位列表（支持扩展筛选，包括大厅、大中小自习室）
 pub async fn get_seats(
     query: web::Query<SeatQueryParams>,
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
     let conn = db.lock().unwrap();
     
-    // 检查是否有扩展列
+    // 检查是否有扩展列（room_type）
     let has_extended = conn.query_row(
-        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
         [],
         |_| Ok(()),
     ).is_ok();
     
     let mut sql = if has_extended {
         String::from(
-            "SELECT id, seat_number, area, floor, room, is_near_socket, is_near_window, 
-             is_quiet_zone, seat_type, status, x_coord, y_coord, created_at, updated_at 
+            "SELECT id, seat_number, area, floor, room_type, room_name, 
+             is_near_socket, is_near_window, is_quiet_zone, seat_type, 
+             status, x_coord, y_coord, created_at, updated_at 
              FROM seats WHERE 1=1"
         )
     } else {
+        // 兼容旧版本
         String::from(
             "SELECT id, seat_number, area, status, x_coord, y_coord, created_at, updated_at 
              FROM seats WHERE 1=1"
@@ -67,9 +70,16 @@ pub async fn get_seats(
             params_vec.push(floor.to_string());
         }
         
-        if let Some(room) = &query.room {
-            sql.push_str(" AND room = ?");
-            params_vec.push(room.clone());
+        // 房间类型筛选（hall, large, medium, small）
+        if let Some(room_type) = &query.room_type {
+            sql.push_str(" AND room_type = ?");
+            params_vec.push(room_type.clone());
+        }
+        
+        // 房间名称筛选（大厅, 大自习室, 中自习室, 小自习室）
+        if let Some(room_name) = &query.room_name {
+            sql.push_str(" AND room_name = ?");
+            params_vec.push(room_name.clone());
         }
         
         if let Some(near_socket) = &query.is_near_socket {
@@ -92,7 +102,7 @@ pub async fn get_seats(
             params_vec.push(seat_type.clone());
         }
         
-        sql.push_str(" ORDER BY floor, area, seat_number");
+        sql.push_str(" ORDER BY floor, room_type, seat_number");
     } else {
         sql.push_str(" ORDER BY area, seat_number");
     }
@@ -119,16 +129,17 @@ pub async fn get_seats(
                     seat_number: row.get(1)?,
                     area: row.get(2)?,
                     floor: row.get(3)?,
-                    room: row.get(4)?,
-                    is_near_socket: row.get(5).unwrap_or(false),
-                    is_near_window: row.get(6).unwrap_or(false),
-                    is_quiet_zone: row.get(7).unwrap_or(false),
-                    seat_type: row.get(8).unwrap_or("standard".to_string()),
-                    status: row.get(9)?,
-                    x_coord: row.get(10)?,
-                    y_coord: row.get(11)?,
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    room_type: row.get(4)?,
+                    room_name: row.get(5)?,
+                    is_near_socket: row.get(6).unwrap_or(false),
+                    is_near_window: row.get(7).unwrap_or(false),
+                    is_quiet_zone: row.get(8).unwrap_or(false),
+                    seat_type: row.get(9).unwrap_or("standard".to_string()),
+                    status: row.get(10)?,
+                    x_coord: row.get(11)?,
+                    y_coord: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             }) {
                 Ok(rows) => rows.collect::<Vec<_>>(),
@@ -148,16 +159,17 @@ pub async fn get_seats(
                     seat_number: row.get(1)?,
                     area: row.get(2)?,
                     floor: row.get(3)?,
-                    room: row.get(4)?,
-                    is_near_socket: row.get(5).unwrap_or(false),
-                    is_near_window: row.get(6).unwrap_or(false),
-                    is_quiet_zone: row.get(7).unwrap_or(false),
-                    seat_type: row.get(8).unwrap_or("standard".to_string()),
-                    status: row.get(9)?,
-                    x_coord: row.get(10)?,
-                    y_coord: row.get(11)?,
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    room_type: row.get(4)?,
+                    room_name: row.get(5)?,
+                    is_near_socket: row.get(6).unwrap_or(false),
+                    is_near_window: row.get(7).unwrap_or(false),
+                    is_quiet_zone: row.get(8).unwrap_or(false),
+                    seat_type: row.get(9).unwrap_or("standard".to_string()),
+                    status: row.get(10)?,
+                    x_coord: row.get(11)?,
+                    y_coord: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             }) {
                 Ok(rows) => rows.collect::<Vec<_>>(),
@@ -180,6 +192,7 @@ pub async fn get_seats(
             data: Some(seats),
         })
     } else {
+        // 基础模式（兼容旧版本）
         let rows = if params_vec.is_empty() {
             match stmt.query_map([], |row| {
                 Ok(Seat {
@@ -247,15 +260,16 @@ pub async fn get_seat_by_id(
     let conn = db.lock().unwrap();
     
     let has_extended = conn.query_row(
-        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
         [],
         |_| Ok(()),
     ).is_ok();
     
     if has_extended {
         let mut stmt = match conn.prepare(
-            "SELECT id, seat_number, area, floor, room, is_near_socket, is_near_window, 
-             is_quiet_zone, seat_type, status, x_coord, y_coord, created_at, updated_at 
+            "SELECT id, seat_number, area, floor, room_type, room_name, 
+             is_near_socket, is_near_window, is_quiet_zone, seat_type, 
+             status, x_coord, y_coord, created_at, updated_at 
              FROM seats WHERE id = ?1"
         ) {
             Ok(stmt) => stmt,
@@ -287,16 +301,17 @@ pub async fn get_seat_by_id(
                 seat_number: row.get(1).unwrap(),
                 area: row.get(2).unwrap(),
                 floor: row.get(3).unwrap(),
-                room: row.get(4).unwrap(),
-                is_near_socket: row.get(5).unwrap_or(false),
-                is_near_window: row.get(6).unwrap_or(false),
-                is_quiet_zone: row.get(7).unwrap_or(false),
-                seat_type: row.get(8).unwrap_or("standard".to_string()),
-                status: row.get(9).unwrap(),
-                x_coord: row.get(10).unwrap(),
-                y_coord: row.get(11).unwrap(),
-                created_at: row.get(12).unwrap(),
-                updated_at: row.get(13).unwrap(),
+                room_type: row.get(4).unwrap(),
+                room_name: row.get(5).unwrap(),
+                is_near_socket: row.get(6).unwrap_or(false),
+                is_near_window: row.get(7).unwrap_or(false),
+                is_quiet_zone: row.get(8).unwrap_or(false),
+                seat_type: row.get(9).unwrap_or("standard".to_string()),
+                status: row.get(10).unwrap(),
+                x_coord: row.get(11).unwrap(),
+                y_coord: row.get(12).unwrap(),
+                created_at: row.get(13).unwrap(),
+                updated_at: row.get(14).unwrap(),
             };
             
             return HttpResponse::Ok().json(ApiResponse {
@@ -307,7 +322,7 @@ pub async fn get_seat_by_id(
         }
     }
     
-    // 基础模式
+    // 基础模式（兼容旧版本）
     let mut stmt = match conn.prepare(
         "SELECT id, seat_number, area, status, x_coord, y_coord, created_at, updated_at FROM seats WHERE id = ?1"
     ) {
@@ -369,16 +384,16 @@ pub async fn get_available_seats(
     let now = Utc::now().to_rfc3339();
     
     let has_extended = conn.query_row(
-        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
         [],
         |_| Ok(()),
     ).is_ok();
     
     let sql = if has_extended {
         r#"
-            SELECT s.id, s.seat_number, s.area, s.floor, s.room, s.is_near_socket, 
-                   s.is_near_window, s.is_quiet_zone, s.seat_type, s.status, 
-                   s.x_coord, s.y_coord, s.created_at, s.updated_at 
+            SELECT s.id, s.seat_number, s.area, s.floor, s.room_type, s.room_name,
+                   s.is_near_socket, s.is_near_window, s.is_quiet_zone, s.seat_type, 
+                   s.status, s.x_coord, s.y_coord, s.created_at, s.updated_at 
             FROM seats s
             WHERE s.status = 'available'
             AND NOT EXISTS (
@@ -388,7 +403,7 @@ pub async fn get_available_seats(
                 AND r.start_time <= ?2
                 AND r.end_time >= ?1
             )
-            ORDER BY s.floor, s.area, s.seat_number
+            ORDER BY s.floor, s.room_type, s.seat_number
         "#
     } else {
         r#"
@@ -428,16 +443,17 @@ pub async fn get_available_seats(
                 seat_number: row.get(1)?,
                 area: row.get(2)?,
                 floor: row.get(3)?,
-                room: row.get(4)?,
-                is_near_socket: row.get(5).unwrap_or(false),
-                is_near_window: row.get(6).unwrap_or(false),
-                is_quiet_zone: row.get(7).unwrap_or(false),
-                seat_type: row.get(8).unwrap_or("standard".to_string()),
-                status: row.get(9)?,
-                x_coord: row.get(10)?,
-                y_coord: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                room_type: row.get(4)?,
+                room_name: row.get(5)?,
+                is_near_socket: row.get(6).unwrap_or(false),
+                is_near_window: row.get(7).unwrap_or(false),
+                is_quiet_zone: row.get(8).unwrap_or(false),
+                seat_type: row.get(9).unwrap_or("standard".to_string()),
+                status: row.get(10)?,
+                x_coord: row.get(11)?,
+                y_coord: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         }) {
             Ok(rows) => rows,
@@ -563,12 +579,73 @@ pub async fn get_floor_stats(
     })
 }
 
-/// 获取会议室列表
+/// 获取会议室列表（兼容旧版本）
 pub async fn get_rooms(
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
     let conn = db.lock().unwrap();
     
+    // 优先使用 room_type 和 room_name
+    let has_room_type = conn.query_row(
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    if has_room_type {
+        let sql = r#"
+            SELECT DISTINCT
+                room_name,
+                floor,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) as available
+            FROM seats
+            WHERE room_name IS NOT NULL AND room_name != ''
+            GROUP BY room_name, floor
+            ORDER BY floor, room_name
+        "#;
+        
+        let mut stmt = match conn.prepare(sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("准备查询失败: {}", e);
+                return HttpResponse::InternalServerError().json(ApiResponse::<Vec<RoomInfo>> {
+                    success: false,
+                    message: "服务器内部错误".to_string(),
+                    data: None,
+                });
+            }
+        };
+        
+        let rows = match stmt.query_map([], |row| {
+            Ok(RoomInfo {
+                room: row.get(0)?,
+                floor: row.get(1)?,
+                total_seats: row.get(2)?,
+                available_seats: row.get(3)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("查询失败: {}", e);
+                return HttpResponse::InternalServerError().json(ApiResponse::<Vec<RoomInfo>> {
+                    success: false,
+                    message: "服务器内部错误".to_string(),
+                    data: None,
+                });
+            }
+        };
+        
+        let rooms: Vec<RoomInfo> = rows.filter_map(|r| r.ok()).collect();
+        
+        return HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: format!("共 {} 个房间", rooms.len()),
+            data: Some(rooms),
+        });
+    }
+    
+    // 兼容旧版本（room 字段）
     let has_room = conn.query_row(
         "SELECT 1 FROM seats WHERE room IS NOT NULL LIMIT 1",
         [],
@@ -578,7 +655,7 @@ pub async fn get_rooms(
     if !has_room {
         return HttpResponse::Ok().json(ApiResponse {
             success: true,
-            message: "暂无会议室数据".to_string(),
+            message: "暂无房间数据".to_string(),
             data: Some(Vec::<RoomInfo>::new()),
         });
     }
@@ -630,8 +707,90 @@ pub async fn get_rooms(
     
     HttpResponse::Ok().json(ApiResponse {
         success: true,
-        message: format!("共 {} 个会议室", rooms.len()),
+        message: format!("共 {} 个房间", rooms.len()),
         data: Some(rooms),
+    })
+}
+
+/// 获取房间统计（大厅、大中小自习室）
+pub async fn get_room_stats(
+    db: web::Data<Mutex<Connection>>,
+) -> impl Responder {
+    let conn = db.lock().unwrap();
+    
+    let has_room_type = conn.query_row(
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+    
+    if !has_room_type {
+        return HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: "暂无房间类型数据".to_string(),
+            data: Some(Vec::<RoomStats>::new()),
+        });
+    }
+    
+    let sql = r#"
+        SELECT 
+            room_type,
+            room_name,
+            floor,
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) as available,
+            SUM(CASE WHEN status = 'occupied' THEN 1 ELSE 0 END) as occupied
+        FROM seats
+        GROUP BY room_type, room_name, floor
+        ORDER BY floor, 
+            CASE room_type
+                WHEN 'hall' THEN 1
+                WHEN 'large' THEN 2
+                WHEN 'medium' THEN 3
+                WHEN 'small' THEN 4
+                ELSE 5
+            END
+    "#;
+    
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("准备查询失败: {}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<RoomStats>> {
+                success: false,
+                message: "服务器内部错误".to_string(),
+                data: None,
+            });
+        }
+    };
+    
+    let rows = match stmt.query_map([], |row| {
+        Ok(RoomStats {
+            room_type: row.get(0)?,
+            room_name: row.get(1)?,
+            floor: row.get(2)?,
+            total_seats: row.get(3)?,
+            available_seats: row.get(4)?,
+            occupied_seats: row.get(5)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("查询失败: {}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<Vec<RoomStats>> {
+                success: false,
+                message: "服务器内部错误".to_string(),
+                data: None,
+            });
+        }
+    };
+    
+    let stats: Vec<RoomStats> = rows.filter_map(|r| r.ok()).collect();
+    
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: format!("共 {} 个房间类型", stats.len()),
+        data: Some(stats),
     })
 }
 
@@ -644,24 +803,28 @@ pub async fn create_seat(
     let conn = db.lock().unwrap();
     
     let has_extended = conn.query_row(
-        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
         [],
         |_| Ok(()),
     ).is_ok();
     
     if has_extended {
         let floor = req.floor.unwrap_or(1);
+        let room_type = req.room_type.clone().unwrap_or_else(|| "hall".to_string());
+        let room_name = req.room_name.clone().unwrap_or_else(|| "大厅".to_string());
         let is_near_socket = req.is_near_socket.unwrap_or(false);
         let is_near_window = req.is_near_window.unwrap_or(false);
         let is_quiet_zone = req.is_quiet_zone.unwrap_or(false);
-        let seat_type = req.seat_type.clone().unwrap_or("standard".to_string());
+        let seat_type = req.seat_type.clone().unwrap_or_else(|| "standard".to_string());
         
         match conn.execute(
-            "INSERT INTO seats (seat_number, area, floor, room, is_near_socket, is_near_window, 
-             is_quiet_zone, seat_type, status, x_coord, y_coord, created_at, updated_at) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9, ?10, ?11, ?11)",
+            "INSERT INTO seats (seat_number, area, floor, room_type, room_name, 
+             is_near_socket, is_near_window, is_quiet_zone, seat_type, 
+             status, x_coord, y_coord, created_at, updated_at) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'available', ?10, ?11, ?12, ?12)",
             params![
-                &req.seat_number, &req.area, &floor, &req.room, 
+                &req.seat_number, &req.area, &floor, 
+                &room_type, &room_name,
                 &(is_near_socket as i32), &(is_near_window as i32), 
                 &(is_quiet_zone as i32), &seat_type,
                 &req.x_coord, &req.y_coord, &now
@@ -732,7 +895,7 @@ pub async fn update_seat(
     let conn = db.lock().unwrap();
     
     let has_extended = conn.query_row(
-        "SELECT 1 FROM seats WHERE floor IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM seats WHERE room_type IS NOT NULL LIMIT 1",
         [],
         |_| Ok(()),
     ).is_ok();
@@ -782,10 +945,17 @@ pub async fn update_seat(
             );
         }
         
-        if let Some(room) = &req.room {
+        if let Some(room_type) = &req.room_type {
             let _ = conn.execute(
-                "UPDATE seats SET room = ?1, updated_at = ?2 WHERE id = ?3",
-                params![room, &now, seat_id],
+                "UPDATE seats SET room_type = ?1, updated_at = ?2 WHERE id = ?3",
+                params![room_type, &now, seat_id],
+            );
+        }
+        
+        if let Some(room_name) = &req.room_name {
+            let _ = conn.execute(
+                "UPDATE seats SET room_name = ?1, updated_at = ?2 WHERE id = ?3",
+                params![room_name, &now, seat_id],
             );
         }
         
