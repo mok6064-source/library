@@ -211,11 +211,49 @@ pub struct SeatQueryParams {
     pub floor: Option<i32>,
     pub room_type: Option<String>,   // hall, large, medium, small
     pub room_name: Option<String>,   // 大厅, 大自习室, 中自习室, 小自习室
+    // 改为 Option<String> 支持多选，用逗号分隔
+    pub features: Option<String>,    // 例如: "near_window,near_socket,quiet_zone"
+    // 保留单个字段用于兼容（但建议前端使用 features）
     pub is_near_socket: Option<bool>,
     pub is_near_window: Option<bool>,
     pub is_quiet_zone: Option<bool>,
     pub seat_type: Option<String>,
     pub status: Option<String>,
+}
+
+// 添加座位功能枚举
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeatFeature {
+    NearSocket,   // 靠近插座
+    NearWindow,   // 靠窗
+    QuietZone,    // 安静区
+}
+
+impl SeatFeature {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SeatFeature::NearSocket => "near_socket",
+            SeatFeature::NearWindow => "near_window",
+            SeatFeature::QuietZone => "quiet_zone",
+        }
+    }
+    
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            SeatFeature::NearSocket => "靠近插座",
+            SeatFeature::NearWindow => "靠窗",
+            SeatFeature::QuietZone => "安静区",
+        }
+    }
+    
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "near_socket" => Some(SeatFeature::NearSocket),
+            "near_window" => Some(SeatFeature::NearWindow),
+            "quiet_zone" => Some(SeatFeature::QuietZone),
+            _ => None,
+        }
+    }
 }
 
 // ========== 统计结构体 ==========

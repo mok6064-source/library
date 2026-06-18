@@ -1,4 +1,4 @@
-// seat_handler.rs
+// seat_handler.rs - 完整修改版本，支持多选功能
 
 use actix_web::{web, HttpResponse, Responder};
 use chrono::Utc;
@@ -7,11 +7,11 @@ use std::sync::Mutex;
 
 use crate::models::{
     ApiResponse, 
-    //CreateSeatRequest, 
+    CreateSeatRequest, 
     CreateSeatRequestExtended,
-    //UpdateSeatRequest,
+    UpdateSeatRequest,
     UpdateSeatRequestExtended,
-    //GetSeatsQuery, 
+    GetSeatsQuery, 
     Seat, 
     SeatInfo,
     FloorStats, 
@@ -19,9 +19,18 @@ use crate::models::{
     RoomStats,
     SeatQueryParams,
     AvailableSeatsQuery,
+    SeatFeature,
 };
 
-/// 获取所有座位列表（支持扩展筛选，包括大厅、大中小自习室）
+/// 解析功能参数，支持多选（用逗号分隔）
+fn parse_features(features_str: &str) -> Vec<SeatFeature> {
+    features_str
+        .split(',')
+        .filter_map(|s| SeatFeature::from_str(s.trim()))
+        .collect()
+}
+
+/// 获取所有座位列表（支持多选筛选）
 pub async fn get_seats(
     query: web::Query<SeatQueryParams>,
     db: web::Data<Mutex<Connection>>,
@@ -82,19 +91,62 @@ pub async fn get_seats(
             params_vec.push(room_name.clone());
         }
         
-        if let Some(near_socket) = &query.is_near_socket {
-            sql.push_str(" AND is_near_socket = ?");
-            params_vec.push(if *near_socket { "1" } else { "0" }.to_string());
-        }
-        
-        if let Some(near_window) = &query.is_near_window {
-            sql.push_str(" AND is_near_window = ?");
-            params_vec.push(if *near_window { "1" } else { "0" }.to_string());
-        }
-        
-        if let Some(quiet_zone) = &query.is_quiet_zone {
-            sql.push_str(" AND is_quiet_zone = ?");
-            params_vec.push(if *quiet_zone { "1" } else { "0" }.to_string());
+        // ========== 多选功能筛选 ==========
+        // 优先使用 features 参数（多选，AND 逻辑）
+        if let Some(features_str) = &query.features {
+            let features = parse_features(features_str);
+            
+            if !features.is_empty() {
+                let mut feature_conditions = Vec::new();
+                
+                for feature in &features {
+                    match feature {
+                        SeatFeature::NearSocket => {
+                            feature_conditions.push("is_near_socket = 1");
+                        }
+                        SeatFeature::NearWindow => {
+                            feature_conditions.push("is_near_window = 1");
+                        }
+                        SeatFeature::QuietZone => {
+                            feature_conditions.push("is_quiet_zone = 1");
+                        }
+                    }
+                }
+                
+                // 使用 AND 连接多个条件（同时满足所有选中的功能）
+                if !feature_conditions.is_empty() {
+                    sql.push_str(" AND (");
+                    sql.push_str(&feature_conditions.join(" AND "));
+                    sql.push_str(")");
+                }
+            }
+        } else {
+            // 兼容旧版单个字段筛选（OR 逻辑，满足任意一个即可）
+            let mut feature_conditions = Vec::new();
+            
+            if let Some(near_socket) = &query.is_near_socket {
+                if *near_socket {
+                    feature_conditions.push("is_near_socket = 1");
+                }
+            }
+            
+            if let Some(near_window) = &query.is_near_window {
+                if *near_window {
+                    feature_conditions.push("is_near_window = 1");
+                }
+            }
+            
+            if let Some(quiet_zone) = &query.is_quiet_zone {
+                if *quiet_zone {
+                    feature_conditions.push("is_quiet_zone = 1");
+                }
+            }
+            
+            if !feature_conditions.is_empty() {
+                sql.push_str(" AND (");
+                sql.push_str(&feature_conditions.join(" OR "));
+                sql.push_str(")");
+            }
         }
         
         if let Some(seat_type) = &query.seat_type {
