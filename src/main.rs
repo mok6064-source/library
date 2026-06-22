@@ -41,6 +41,7 @@ use reservation_handler::{
     get_available_dates_api,
     get_available_time_slots_api,
     check_reservation_time,
+    get_daily_reservation_status,
 };
 
 use attendance_handler::{
@@ -118,6 +119,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/reservations/{id}", web::get().to(get_reservation_detail))
             .route("/api/reservations/{id}", web::delete().to(cancel_reservation))
             .route("/api/reservations/{id}/extend", web::put().to(extend_reservation))
+            .route("/api/reservations/daily-status", web::get().to(get_daily_reservation_status)) // 获取每日预约状态
     })
     .bind("127.0.0.1:8080")?
     .run()

@@ -1,4 +1,4 @@
-// reservation_validator.rs - 移除未使用的变量
+// reservation_validator.rs - 更新时间验证
 
 use chrono::{DateTime, Utc, Duration, NaiveDate, NaiveDateTime, Timelike};
 
@@ -44,8 +44,8 @@ pub fn validate_reservation_time(
     let now = Utc::now();
     let now_date = now.date_naive();
     
-    // 2. 检查开始时间是否在当前时间之后（允许提前15分钟）
-    if start_time < now {
+    // 2. 检查开始时间是否在当前时间之后（允许提前30分钟）
+    if start_time < now - Duration::minutes(30) {
         return ValidationResult {
             is_valid: false,
             message: "开始时间不能早于当前时间".to_string(),
@@ -86,7 +86,7 @@ pub fn validate_reservation_time(
         };
     }
     
-    // 5. 检查预约时长（最长4小时，最短30分钟）
+    // 5. 检查预约时长（自定义，不超过4小时，最短30分钟）
     let duration = end_time.signed_duration_since(start_time);
     if duration.num_hours() > 4 {
         return ValidationResult {
@@ -137,11 +137,10 @@ pub fn get_available_dates() -> Vec<String> {
     dates
 }
 
-/// 获取某个日期的可用时间段（9:00 - 21:00，每小时一个时段）
+/// 获取某个日期的可用时间段（自定义时长）
 pub fn get_available_time_slots(date_str: &str) -> Vec<String> {
     let mut slots = Vec::new();
     
-    // 解析日期
     let date = match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
         Ok(d) => d,
         Err(_) => return slots,
@@ -150,29 +149,30 @@ pub fn get_available_time_slots(date_str: &str) -> Vec<String> {
     let now = Utc::now();
     let now_date = now.date_naive();
     
-    // 9:00 到 21:00，每小时一个时段
-    for hour in 9..21 {
-        let time_str = format!("{:02}:00", hour);
-        
-        // 如果是今天，跳过已经过去的时间（提前30分钟）
-        if date == now_date {
-            let slot_time = NaiveDateTime::parse_from_str(
-                &format!("{} {}", date_str, time_str),
-                "%Y-%m-%d %H:%M"
-            ).unwrap();
+    // 8:00 到 22:00，每30分钟一个时段
+    for hour in 8..22 {
+        for minute in [0, 30] {
+            let time_str = format!("{:02}:{:02}", hour, minute);
             
-            let slot_datetime = DateTime::<Utc>::from_naive_utc_and_offset(
-                slot_time,
-                Utc
-            );
-            
-            // 如果这个时段已经过去，跳过
-            if slot_datetime < now - Duration::minutes(30) {
-                continue;
+            // 如果是今天，跳过已经过去的时间（提前30分钟）
+            if date == now_date {
+                let slot_time = NaiveDateTime::parse_from_str(
+                    &format!("{} {}", date_str, time_str),
+                    "%Y-%m-%d %H:%M"
+                ).unwrap();
+                
+                let slot_datetime = DateTime::<Utc>::from_naive_utc_and_offset(
+                    slot_time,
+                    Utc
+                );
+                
+                if slot_datetime < now - Duration::minutes(30) {
+                    continue;
+                }
             }
+            
+            slots.push(time_str);
         }
-        
-        slots.push(time_str);
     }
     
     slots

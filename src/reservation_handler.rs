@@ -1,7 +1,7 @@
-// reservation_handler.rs - 完整修复版本
+// reservation_handler.rs - 修复错误
 
 use actix_web::{web, HttpResponse, Responder};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, NaiveDate};
 use rusqlite::{Connection, params};
 use std::sync::Mutex;
 
@@ -14,7 +14,7 @@ use crate::reservation_validator::{
     get_available_time_slots,
 };
 
-/// 创建预约
+/// 创建预约（包含新规则：三天内、每天一个、自定义时长≤4小时）
 pub async fn create_reservation(
     req: web::Json<CreateReservationRequest>,
     query: web::Query<std::collections::HashMap<String, String>>,
@@ -23,9 +23,9 @@ pub async fn create_reservation(
     let user_id = query.get("user_id").and_then(|s| s.parse().ok()).unwrap_or(1);
     let now = Utc::now().to_rfc3339();
     
-    // 验证时间
+    // 1. 验证时间格式
     let start_time = match DateTime::parse_from_rfc3339(&req.start_time) {
-        Ok(t) => t,
+        Ok(t) => t.with_timezone(&Utc),
         Err(_) => {
             return HttpResponse::BadRequest().json(ApiResponse::<()> {
                 success: false,
@@ -36,7 +36,7 @@ pub async fn create_reservation(
     };
     
     let end_time = match DateTime::parse_from_rfc3339(&req.end_time) {
-        Ok(t) => t,
+        Ok(t) => t.with_timezone(&Utc),
         Err(_) => {
             return HttpResponse::BadRequest().json(ApiResponse::<()> {
                 success: false,
@@ -47,7 +47,29 @@ pub async fn create_reservation(
     };
     
     let now_time = Utc::now();
-    if start_time < now_time {
+    let start_date = start_time.date_naive();
+    let now_date = now_time.date_naive();
+    let max_date = now_date + chrono::Duration::days(3);
+    
+    // 2. 检查预约日期是否在三天内
+    if start_date < now_date {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            message: "预约日期不能早于今天".to_string(),
+            data: None,
+        });
+    }
+    
+    if start_date > max_date {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            message: format!("预约日期不能超过三天（最大允许日期: {}）", max_date),
+            data: None,
+        });
+    }
+    
+    // 3. 检查开始时间是否在当前时间之后（允许提前15分钟）
+    if start_time < now_time - chrono::Duration::minutes(15) {
         return HttpResponse::BadRequest().json(ApiResponse::<()> {
             success: false,
             message: "开始时间不能早于当前时间".to_string(),
@@ -55,6 +77,7 @@ pub async fn create_reservation(
         });
     }
     
+    // 4. 检查结束时间是否晚于开始时间
     if end_time <= start_time {
         return HttpResponse::BadRequest().json(ApiResponse::<()> {
             success: false,
@@ -63,6 +86,7 @@ pub async fn create_reservation(
         });
     }
     
+    // 5. 检查预约时长（自定义，最短30分钟，最长4小时）
     let duration = end_time.signed_duration_since(start_time);
     if duration.num_hours() > 4 {
         return HttpResponse::BadRequest().json(ApiResponse::<()> {
@@ -72,9 +96,41 @@ pub async fn create_reservation(
         });
     }
     
+    if duration.num_minutes() < 30 {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            message: "单次预约最短不能少于30分钟".to_string(),
+            data: None,
+        });
+    }
+    
     let conn = db.lock().unwrap();
     
-    // 检查座位是否存在且可用
+    // 6. 检查该用户当天是否已有预约（每天只能预约一个）
+    let existing_count: i32 = match conn.query_row(
+        "SELECT COUNT(*) FROM reservations 
+         WHERE user_id = ?1 
+         AND status IN ('pending', 'active')
+         AND date(start_time) = date(?2)",
+        params![user_id, &req.start_time],
+        |row| row.get(0),
+    ) {
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!("查询当天预约失败: {}", e);
+            0
+        }
+    };
+    
+    if existing_count > 0 {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            message: "您当天已有一个预约，每天只能预约一个位置".to_string(),
+            data: None,
+        });
+    }
+    
+    // 7. 检查座位是否存在且可用
     let seat_status: String = match conn.query_row(
         "SELECT status FROM seats WHERE id = ?1",
         params![req.seat_id],
@@ -98,7 +154,7 @@ pub async fn create_reservation(
         });
     }
     
-    // 检查时间冲突
+    // 8. 检查时间冲突
     let conflict: bool = match conn.query_row(
         "SELECT 1 FROM reservations 
          WHERE seat_id = ?1 
@@ -120,7 +176,7 @@ pub async fn create_reservation(
         });
     }
     
-    // 检查用户是否有未完成的预约
+    // 9. 检查用户是否有未完成的预约（最多3个）
     let active_count: i32 = conn.query_row(
         "SELECT COUNT(*) FROM reservations WHERE user_id = ?1 AND status IN ('pending', 'active')",
         params![user_id],
@@ -135,7 +191,7 @@ pub async fn create_reservation(
         });
     }
     
-    // 创建预约
+    // 10. 创建预约
     match conn.execute(
         "INSERT INTO reservations (user_id, seat_id, start_time, end_time, status, created_at, updated_at) 
          VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5)",
@@ -148,9 +204,25 @@ pub async fn create_reservation(
                 params![&now, req.seat_id],
             );
             
+            // 计算时长显示
+            let hours = duration.num_hours();
+            let minutes = duration.num_minutes() % 60;
+            let duration_str = if hours > 0 && minutes > 0 {
+                format!("{}小时{}分钟", hours, minutes)
+            } else if hours > 0 {
+                format!("{}小时", hours)
+            } else {
+                format!("{}分钟", minutes)
+            };
+            
             HttpResponse::Ok().json(ApiResponse::<()> {
                 success: true,
-                message: "预约成功，请在规定时间内签到".to_string(),
+                message: format!(
+                    "✅ 预约成功！日期: {}，时长: {}，请在 {} 前签到",
+                    start_date,
+                    duration_str,
+                    start_time.format("%H:%M")
+                ),
                 data: None,
             })
         },
@@ -163,6 +235,88 @@ pub async fn create_reservation(
             })
         }
     }
+}
+
+/// 获取用户某天的预约状态
+pub async fn get_daily_reservation_status(
+    query: web::Query<std::collections::HashMap<String, String>>,
+    db: web::Data<Mutex<Connection>>,
+) -> impl Responder {
+    let user_id = query.get("user_id").and_then(|s| s.parse().ok()).unwrap_or(1);
+    
+    // 使用 let 绑定创建长期存在的值，避免临时值被释放
+    let default_date = String::new();
+    let date_str = query.get("date").unwrap_or(&default_date);
+    
+    if date_str.is_empty() {
+        return HttpResponse::BadRequest().json(ApiResponse::<serde_json::Value> {
+            success: false,
+            message: "请提供日期参数".to_string(),
+            data: None,
+        });
+    }
+    
+    // 验证日期格式
+    if NaiveDate::parse_from_str(date_str, "%Y-%m-%d").is_err() {
+        return HttpResponse::BadRequest().json(ApiResponse::<serde_json::Value> {
+            success: false,
+            message: "日期格式错误，请使用 YYYY-MM-DD 格式".to_string(),
+            data: None,
+        });
+    }
+    
+    let conn = db.lock().unwrap();
+    
+    // 检查该用户当天是否有预约
+    let has_reservation: bool = conn.query_row(
+        "SELECT 1 FROM reservations 
+         WHERE user_id = ?1 
+         AND status IN ('pending', 'active')
+         AND date(start_time) = date(?2)
+         LIMIT 1",
+        params![user_id, date_str],
+        |_| Ok(true),
+    ).is_ok();
+    
+    // 获取当天的预约详情（如果有）
+    let reservation_info: Option<serde_json::Value> = if has_reservation {
+        match conn.query_row(
+            "SELECT id, seat_id, start_time, end_time, status 
+             FROM reservations 
+             WHERE user_id = ?1 
+             AND status IN ('pending', 'active')
+             AND date(start_time) = date(?2)
+             LIMIT 1",
+            params![user_id, date_str],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i32>(0)?,
+                    "seat_id": row.get::<_, i32>(1)?,
+                    "start_time": row.get::<_, String>(2)?,
+                    "end_time": row.get::<_, String>(3)?,
+                    "status": row.get::<_, String>(4)?
+                }))
+            }
+        ) {
+            Ok(info) => Some(info),
+            Err(_) => None
+        }
+    } else {
+        None
+    };
+    
+    let result = serde_json::json!({
+        "date": date_str,
+        "has_reservation": has_reservation,
+        "can_reserve": !has_reservation,
+        "reservation": reservation_info
+    });
+    
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: if has_reservation { "当天已有预约".to_string() } else { "当天可预约".to_string() },
+        data: Some(result),
+    })
 }
 
 /// 获取我的预约列表
@@ -298,7 +452,7 @@ pub async fn get_reservation_detail(
     }
 }
 
-/// 取消预约（修复版）
+/// 取消预约
 pub async fn cancel_reservation(
     path: web::Path<i32>,
     query: web::Query<std::collections::HashMap<String, String>>,
@@ -308,10 +462,9 @@ pub async fn cancel_reservation(
     let user_id = query.get("user_id").and_then(|s| s.parse().ok()).unwrap_or(1);
     let now = Utc::now().to_rfc3339();
     
-    // 获取数据库连接 - 声明为 mut
     let mut conn = db.lock().unwrap();
     
-    // 1. 先查询预约信息，确认存在且属于该用户
+    // 1. 先查询预约信息
     let reservation_info = match conn.query_row(
         "SELECT seat_id, start_time, status FROM reservations WHERE id = ?1 AND user_id = ?2",
         params![reservation_id, user_id],
@@ -336,7 +489,7 @@ pub async fn cancel_reservation(
     
     let (seat_id, start_time_str, status) = reservation_info;
     
-    // 2. 检查状态（只有 pending 和 active 可以取消）
+    // 2. 检查状态
     if status != "pending" && status != "active" {
         return HttpResponse::BadRequest().json(ApiResponse::<()> {
             success: false,
@@ -353,13 +506,13 @@ pub async fn cancel_reservation(
         if time_to_start.num_minutes() < 30 && status == "pending" {
             return HttpResponse::BadRequest().json(ApiResponse::<()> {
                 success: false,
-                message: "预约开始前30分钟内不能取消，如需取消请联系管理员".to_string(),
+                message: "预约开始前30分钟内不能取消".to_string(),
                 data: None,
             });
         }
     }
     
-    // 4. 开启事务，确保原子性
+    // 4. 开启事务
     let transaction = match conn.transaction() {
         Ok(tx) => tx,
         Err(e) => {
@@ -372,7 +525,7 @@ pub async fn cancel_reservation(
         }
     };
     
-    // 5. 更新预约状态为 cancelled
+    // 5. 更新预约状态
     if let Err(e) = transaction.execute(
         "UPDATE reservations SET status = 'cancelled', updated_at = ?1 WHERE id = ?2",
         params![&now, reservation_id],
@@ -386,7 +539,7 @@ pub async fn cancel_reservation(
         });
     }
     
-    // 6. 释放座位 - 将座位状态改为 available
+    // 6. 释放座位
     if let Err(e) = transaction.execute(
         "UPDATE seats SET status = 'available', updated_at = ?1 WHERE id = ?2",
         params![&now, seat_id],
@@ -400,13 +553,7 @@ pub async fn cancel_reservation(
         });
     }
     
-    // 7. 如果有签到记录，也更新状态（如果存在）
-    let _ = transaction.execute(
-        "UPDATE attendance SET checkout_time = ?1 WHERE reservation_id = ?2 AND checkout_time IS NULL",
-        params![&now, reservation_id],
-    );
-    
-    // 8. 提交事务
+    // 7. 提交事务
     if let Err(e) = transaction.commit() {
         eprintln!("提交事务失败: {}", e);
         return HttpResponse::InternalServerError().json(ApiResponse::<()> {
@@ -480,6 +627,24 @@ pub async fn extend_reservation(
     let new_end_time = end_time + chrono::Duration::hours(req.extra_hours as i64);
     let new_end_time_str = new_end_time.to_rfc3339();
     
+    // 检查续约后是否超过4小时
+    let start_time: String = conn.query_row(
+        "SELECT start_time FROM reservations WHERE id = ?1",
+        params![reservation_id],
+        |row| row.get(0),
+    ).unwrap_or_default();
+    
+    if let Ok(start) = DateTime::parse_from_rfc3339(&start_time) {
+        let new_duration = new_end_time - start;
+        if new_duration.num_hours() > 4 {
+            return HttpResponse::BadRequest().json(ApiResponse::<()> {
+                success: false,
+                message: "续约后总时长不能超过4小时".to_string(),
+                data: None,
+            });
+        }
+    }
+    
     let conflict: bool = match conn.query_row(
         "SELECT 1 FROM reservations 
          WHERE seat_id = ?1 
@@ -540,7 +705,6 @@ pub async fn get_available_time_slots_api(
     query: web::Query<std::collections::HashMap<String, String>>,
     db: web::Data<Mutex<Connection>>,
 ) -> impl Responder {
-    // 使用 let 绑定创建长期存在的值
     let default_date = String::new();
     let date = query.get("date").unwrap_or(&default_date).clone();
     
@@ -552,7 +716,6 @@ pub async fn get_available_time_slots_api(
         });
     }
     
-    // 验证日期是否在三天内
     let available_dates = get_available_dates();
     if !available_dates.contains(&date) {
         return HttpResponse::BadRequest().json(ApiResponse::<Vec<String>> {
@@ -564,13 +727,12 @@ pub async fn get_available_time_slots_api(
     
     let slots = get_available_time_slots(&date);
     
-    // 获取该日期已被预约的时间段
     let conn = db.lock().unwrap();
     let date_start = format!("{}T00:00:00+08:00", date);
     let date_end = format!("{}T23:59:59+08:00", date);
     
     let booked_slots: Vec<String> = match conn.prepare(
-        "SELECT strftime('%H:00', start_time) as slot
+        "SELECT strftime('%H:%M', start_time) as slot
          FROM reservations 
          WHERE status IN ('pending', 'active')
          AND start_time >= ?1
@@ -595,7 +757,6 @@ pub async fn get_available_time_slots_api(
         }
     };
     
-    // 过滤掉已被预约的时间段
     let available_slots: Vec<String> = slots
         .into_iter()
         .filter(|slot| !booked_slots.contains(slot))
@@ -612,7 +773,6 @@ pub async fn get_available_time_slots_api(
 pub async fn check_reservation_time(
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> impl Responder {
-    // 使用 let 绑定创建长期存在的值
     let default_start = String::new();
     let default_end = String::new();
     
